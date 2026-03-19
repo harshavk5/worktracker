@@ -201,12 +201,12 @@ class TrackerWindow:
     """
 
     def __init__(self, root, cfg, on_submit, on_dismiss,
-                 start_tab="Log", countdown_seconds=0):
-        self.cfg               = cfg
-        self.on_submit         = on_submit
-        self.on_dismiss        = on_dismiss
-        self.countdown_seconds = countdown_seconds
-        self._jobs             = []
+                 start_tab="Log", scheduler=None):
+        self.cfg        = cfg
+        self.on_submit  = on_submit
+        self.on_dismiss = on_dismiss
+        self.scheduler  = scheduler   # used to read live remaining seconds
+        self._jobs      = []
 
         self.win = tk.Toplevel(root)
         self.win.title("Productivity Tracker")
@@ -322,7 +322,7 @@ class TrackerWindow:
 
         # Start ticking — panels dict exists at this point
         self._tick_clock()
-        self._tick_countdown(self.countdown_seconds)
+        self._tick_countdown()
 
         return f
 
@@ -350,9 +350,9 @@ class TrackerWindow:
         job = self.win.after(1000, self._tick_clock)
         self._jobs.append(job)
 
-    def _tick_countdown(self, remaining: int):
-        if remaining < 0:
-            remaining = 0
+    def _tick_countdown(self):
+        # Always read live value from scheduler — no local counter, no drift
+        remaining = self.scheduler.remaining_seconds() if self.scheduler else 0
 
         mins = remaining // 60
         secs = remaining % 60
@@ -363,9 +363,8 @@ class TrackerWindow:
                 C["subtext"]
         self._cd_lbl.config(fg=color)
 
-        if remaining > 0:
-            job = self.win.after(1000, self._tick_countdown, remaining - 1)
-            self._jobs.append(job)
+        job = self.win.after(1000, self._tick_countdown)
+        self._jobs.append(job)
 
     # ── History panel ─────────────────────────────────────────────────────────
     def _build_history_panel(self):
@@ -638,31 +637,23 @@ class App:
         self.root.withdraw()
         self.root.title("Productivity Tracker")
 
-    def _open_window(self, start_tab="Log", countdown=None):
-        # Always use live remaining seconds from scheduler
-        # so countdown is accurate whether opened by alarm or tray click
-        live_remaining = self.scheduler.remaining_seconds()
-        cd = live_remaining if countdown is None else countdown
-
-        # Window already open — lift and switch tab, update countdown seed
+    def _open_window(self, start_tab="Log", **_):
+        # Window already open — lift and switch tab
         if self.active_win is not None:
             try:
                 self.active_win.tab_bar._switch(start_tab)
                 self.active_win.win.lift()
-                # Re-seed countdown with latest value
-                self.active_win.countdown_seconds = cd
-                self.active_win._tick_countdown(cd)
                 return
             except tk.TclError:
                 self.active_win = None
 
         self.active_win = TrackerWindow(
-            root              = self.root,
-            cfg               = self.cfg,
-            on_submit         = self._on_submit,
-            on_dismiss        = self._on_dismiss,
-            start_tab         = start_tab,
-            countdown_seconds = cd
+            root        = self.root,
+            cfg         = self.cfg,
+            on_submit   = self._on_submit,
+            on_dismiss  = self._on_dismiss,
+            start_tab   = start_tab,
+            scheduler   = self.scheduler
         )
 
     def _on_submit(self, category, note):
