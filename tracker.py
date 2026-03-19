@@ -550,6 +550,7 @@ class Scheduler:
         self.ui_queue           = ui_queue
         self.cfg                = load_config()
         self.consecutive_missed = 0
+        self._deadline          = None   # set by run(), read by remaining_seconds()
 
     def on_submit(self, category, note):
         now_m       = now_minutes()
@@ -582,21 +583,26 @@ class Scheduler:
                 retro_mark_break(threshold)
                 self.consecutive_missed = 0
 
+    def remaining_seconds(self) -> int:
+        """How many seconds until the next popup fires. Thread-safe read."""
+        if self._deadline is None:
+            return 0
+        return max(0, int(self._deadline - time.monotonic()))
+
     def run(self):
-        import time as _time
+        self._deadline = None
         while True:
             self.cfg     = load_config()
             interval_sec = self.cfg["interval_minutes"] * 60
 
             # Deadline-based sleep — immune to drift under system load
-            # Instead of counting 1800 x 1s ticks, we target a fixed end time
-            deadline = _time.monotonic() + interval_sec
+            self._deadline = time.monotonic() + interval_sec
             while True:
-                remaining = deadline - _time.monotonic()
+                remaining = self._deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                # Sleep in small chunks so thread stays responsive
-                _time.sleep(min(1.0, remaining))
+                time.sleep(min(1.0, remaining))
+            self._deadline = None
 
             self.cfg  = load_config()
             now_m     = now_minutes()
@@ -632,12 +638,20 @@ class App:
         self.root.withdraw()
         self.root.title("Productivity Tracker")
 
-    def _open_window(self, start_tab="Log", countdown=0):
-        # Window already open — lift and switch tab
+    def _open_window(self, start_tab="Log", countdown=None):
+        # Always use live remaining seconds from scheduler
+        # so countdown is accurate whether opened by alarm or tray click
+        live_remaining = self.scheduler.remaining_seconds()
+        cd = live_remaining if countdown is None else countdown
+
+        # Window already open — lift and switch tab, update countdown seed
         if self.active_win is not None:
             try:
                 self.active_win.tab_bar._switch(start_tab)
                 self.active_win.win.lift()
+                # Re-seed countdown with latest value
+                self.active_win.countdown_seconds = cd
+                self.active_win._tick_countdown(cd)
                 return
             except tk.TclError:
                 self.active_win = None
@@ -648,7 +662,7 @@ class App:
             on_submit         = self._on_submit,
             on_dismiss        = self._on_dismiss,
             start_tab         = start_tab,
-            countdown_seconds = countdown
+            countdown_seconds = cd
         )
 
     def _on_submit(self, category, note):
