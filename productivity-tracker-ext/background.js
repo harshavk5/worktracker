@@ -111,9 +111,7 @@ chrome.alarms.onAlarm.addListener(async alarm => {
 
   const isWorkHours = inRange(now, settings.work_start, settings.work_end);
   const isLunch     = inRange(now, settings.lunch_start, settings.lunch_end);
-
-  // Outside work hours — do nothing
-  if (!isWorkHours) return;
+  const isOvertime  = !isWorkHours; // anything before work_start or after work_end
 
   // Lunch — silent log, no popup
   if (isLunch) {
@@ -121,15 +119,15 @@ chrome.alarms.onAlarm.addListener(async alarm => {
     return;
   }
 
-  // Store pending slot so popup can read it
-  await chrome.storage.local.set({ pending_slot: { date, time_slot: slot, day } });
+  // Store pending slot so popup can read it (work hours + overtime both get a popup)
+  await chrome.storage.local.set({ pending_slot: { date, time_slot: slot, day, is_overtime: isOvertime } });
 
-  // Fire notification — clicking opens the popup
+  // Fire notification — label differs for overtime
   chrome.notifications.create("prod-tick", {
     type:     "basic",
     iconUrl:  "icons/icon48.png",
-    title:    "Productivity Tracker",
-    message:  `Log your ${slot} window`,
+    title:    isOvertime ? "Productivity Tracker — Overtime" : "Productivity Tracker",
+    message:  isOvertime ? `⚠ ${slot} — logging overtime window` : `Log your ${slot} window`,
     priority: 2,
     requireInteraction: false
   });
@@ -143,17 +141,21 @@ chrome.alarms.onAlarm.addListener(async alarm => {
     // Still pending = user didn't submit
     if (pending && pending.time_slot === slot) {
       await chrome.storage.local.remove("pending_slot");
-      await appendLog({ date, time_slot: slot, day, category: "", note: "", entry_type: "missed" });
+      const missedType = pending.is_overtime ? "overtime" : "missed";
+      await appendLog({ date, time_slot: slot, day, category: "", note: "", entry_type: missedType });
 
-      const settings2 = await getSettings();
-      const logs      = await getLogs();
-      const recent    = logs.slice(-settings2.break_threshold_windows);
+      // Break inference only applies within work hours (not overtime)
+      if (!pending.is_overtime) {
+        const settings2 = await getSettings();
+        const logs      = await getLogs();
+        const recent    = logs.slice(-settings2.break_threshold_windows);
 
-      if (
-        recent.length === settings2.break_threshold_windows &&
-        recent.every(r => r.entry_type === "missed")
-      ) {
-        await retroMarkBreak(settings2.break_threshold_windows);
+        if (
+          recent.length === settings2.break_threshold_windows &&
+          recent.every(r => r.entry_type === "missed")
+        ) {
+          await retroMarkBreak(settings2.break_threshold_windows);
+        }
       }
     }
   }, 3 * 60 * 1000); // 3 min window to respond
@@ -196,7 +198,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         ...slot,
         category:   msg.category,
         note:       msg.note,
-        entry_type: "logged"
+        entry_type: pending?.is_overtime ? "overtime" : "logged"
       });
 
       await chrome.storage.local.remove("pending_slot");
