@@ -583,18 +583,20 @@ class Scheduler:
                 self.consecutive_missed = 0
 
     def run(self):
+        import time as _time
         while True:
             self.cfg     = load_config()
             interval_sec = self.cfg["interval_minutes"] * 60
 
-            # Sleep in 1s ticks so countdown stays accurate
-            for remaining in range(interval_sec, 0, -1):
-                time.sleep(1)
-                # Update countdown in any open window via queue
-                self.ui_queue.put({
-                    "action":    "countdown_tick",
-                    "remaining": remaining - 1
-                })
+            # Deadline-based sleep — immune to drift under system load
+            # Instead of counting 1800 x 1s ticks, we target a fixed end time
+            deadline = _time.monotonic() + interval_sec
+            while True:
+                remaining = deadline - _time.monotonic()
+                if remaining <= 0:
+                    break
+                # Sleep in small chunks so thread stays responsive
+                _time.sleep(min(1.0, remaining))
 
             self.cfg  = load_config()
             now_m     = now_minutes()
@@ -669,14 +671,6 @@ class App:
                 elif msg["action"] == "show_history":
                     self._open_window(start_tab="History")
 
-                elif msg["action"] == "countdown_tick":
-                    # Update countdown on open window if it exists
-                    if self.active_win is not None:
-                        try:
-                            self.active_win._tick_countdown(msg["remaining"])
-                        except (tk.TclError, AttributeError):
-                            pass
-
         except queue.Empty:
             pass
 
@@ -695,7 +689,8 @@ class App:
             draw.line([32, 32, 40, 36], fill="#cdd6f4", width=2)
 
             def on_click(icon, item):
-                self.ui_queue.put({"action": "show_history"})
+                self.ui_queue.put({"action": "show_popup",
+                                   "tab": "Log", "countdown": 0})
 
             def open_settings(icon, item):
                 self.ui_queue.put({"action": "show_popup",
@@ -711,7 +706,8 @@ class App:
                 self.root.after(0, self.root.destroy)
 
             menu = pystray.Menu(
-                pystray.MenuItem("History",    on_click, default=True),
+                pystray.MenuItem("Log",        on_click, default=True),
+                pystray.MenuItem("History",    lambda i, it: i and self.ui_queue.put({"action": "show_history"})),
                 pystray.MenuItem("Settings",   open_settings),
                 pystray.MenuItem("Export CSV", do_export),
                 pystray.MenuItem("Quit",       quit_app),
