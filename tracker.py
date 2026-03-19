@@ -1,10 +1,10 @@
 """
 Productivity Tracker v2 — Windows Background Process
-- Main thread owns Tkinter (fixes RuntimeError)
-- pystray runs in daemon thread
-- Countdown timer to next poll
-- System tray click opens History window
-- Clean status labels
+Threading model:
+  Main thread   → Tkinter event loop (all UI)
+  Scheduler     → daemon thread, posts to ui_queue
+  pystray       → daemon thread
+  Communication → queue.Queue polled every 200ms on main thread
 """
 
 import csv
@@ -13,9 +13,9 @@ import sys
 import time
 import threading
 import queue
+import datetime as dt
 import tkinter as tk
 from tkinter import ttk
-from datetime import datetime
 from pathlib import Path
 import json
 
@@ -107,7 +107,7 @@ def export_csv():
     rows = read_rows()
     if not rows:
         return None
-    out = LOG_DIR / f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    out = LOG_DIR / f"export_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     with open(out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         w.writeheader()
@@ -116,7 +116,7 @@ def export_csv():
 
 # ── Time helpers ──────────────────────────────────────────────────────────────
 def now_minutes() -> int:
-    d = datetime.now()
+    d = dt.datetime.now()
     return d.hour * 60 + d.minute
 
 def parse_hhmm(s: str) -> int:
@@ -126,9 +126,9 @@ def parse_hhmm(s: str) -> int:
 def in_range(now_m: int, start: str, end: str) -> bool:
     return parse_hhmm(start) <= now_m <= parse_hhmm(end)
 
-def today_str()    -> str: return datetime.now().strftime("%Y-%m-%d")
-def day_name()     -> str: return datetime.now().strftime("%A")
-def current_slot() -> str: return datetime.now().strftime("%H:%M")
+def today_str()    -> str: return dt.datetime.now().strftime("%Y-%m-%d")
+def day_name()     -> str: return dt.datetime.now().strftime("%A")
+def current_slot() -> str: return dt.datetime.now().strftime("%H:%M")
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
 def styled_button(parent, text, command, style="primary"):
@@ -192,25 +192,21 @@ class TabBar(tk.Frame):
         for name, btn in self.buttons.items():
             btn.config(fg=C["accent"] if name == self.active else C["subtext"])
 
-# ── Main window (Log / History / Settings) ───────────────────────────────────
+# ── Tracker Window ────────────────────────────────────────────────────────────
 class TrackerWindow:
     """
-    Single window — all three tabs.
-    Always created and destroyed on the main thread.
-    start_tab: which tab to open on ("Log", "History", "Settings")
-    on_submit / on_dismiss: callbacks to scheduler (called before destroy)
-    countdown_seconds: passed in so Log tab can show live countdown
+    All three tabs in one Toplevel window.
+    Must be created on the main thread only.
+    countdown_seconds: live countdown shown in Log tab.
     """
 
-    def __init__(self, root: tk.Tk, cfg: dict,
-                 on_submit, on_dismiss,
-                 start_tab="Log",
-                 countdown_seconds=0):
+    def __init__(self, root, cfg, on_submit, on_dismiss,
+                 start_tab="Log", countdown_seconds=0):
         self.cfg               = cfg
         self.on_submit         = on_submit
         self.on_dismiss        = on_dismiss
         self.countdown_seconds = countdown_seconds
-        self._jobs             = []   # after() ids to cancel on close
+        self._jobs             = []
 
         self.win = tk.Toplevel(root)
         self.win.title("Productivity Tracker")
@@ -220,6 +216,7 @@ class TrackerWindow:
         self.win.protocol("WM_DELETE_WINDOW", self._dismiss)
         center_window(self.win, 390, 370)
 
+        # Build all panels first, then switch to start_tab
         self._build()
         self.tab_bar._switch(start_tab)
 
@@ -234,12 +231,11 @@ class TrackerWindow:
         self.container = tk.Frame(self.win, bg=C["bg"])
         self.container.pack(fill="both", expand=True)
 
-        self.panels = {
-            "Log":      self._build_log_panel(),
-            "History":  self._build_history_panel(),
-            "Settings": self._build_settings_panel(),
-        }
-        self._show_panel("Log")
+        # Build all panels and store — _show_panel controls visibility
+        self.panels = {}
+        self.panels["Log"]      = self._build_log_panel()
+        self.panels["History"]  = self._build_history_panel()
+        self.panels["Settings"] = self._build_settings_panel()
 
     def _on_tab(self, name):
         self._show_panel(name)
@@ -255,11 +251,11 @@ class TrackerWindow:
     def _build_log_panel(self):
         f = tk.Frame(self.container, bg=C["bg"])
 
-        # ── Clock + countdown row
+        # Top row: clock (left) + meta (centre-left) + countdown (right)
         top_row = tk.Frame(f, bg=C["bg"])
         top_row.pack(fill="x", pady=(0, 10))
 
-        # Live clock (left)
+        # Live clock
         self.clock_var = tk.StringVar(value="--:--:--")
         self.clock_lbl = tk.Label(
             top_row, textvariable=self.clock_var,
@@ -268,147 +264,7 @@ class TrackerWindow:
         )
         self.clock_lbl.pack(side="left")
 
-        # Meta (right of clock)
-        meta = tk.Frame(top_row, bg=C["bg"])
-        meta.pack(side="left", padx=(10, 0))
-
-        self.date_var   = tk.StringVar()
-        self.status_var = tk.StringVar()
-
-        tk.Label(meta, textvariable=self.date_var,
-                 bg=C["bg"], fg=C["subtext"],
-                 font=("Segoe UI", 9)).pack(anchor="w")
-
-        self.status_lbl = tk.Label(meta, textvariable=self.status_var,
-                 bg=C["bg"], fg=C["accent"],
-                 font=("Segoe UI", 9, "bold"))
-        self.status_lbl.pack(anchor="w")
-
-        # Countdown (far right)
-        countdown_frame = tk.Frame(top_row, bg=C["bg"])
-        countdown_frame.pack(side="right")
-
-        tk.Label(countdown_frame, text="next poll",
-                 bg=C["bg"], fg=C["subtext"],
-                 font=("Segoe UI", 8)).pack(anchor="e")
-
-        self.countdown_var = tk.StringVar(value="--:--")
-        tk.Label(countdown_frame, textvariable=self.countdown_var,
-                 bg=C["bg"], fg=C["border"],
-                 font=("Consolas", 14, "bold")).pack(anchor="e")
-
-        # ── Category
-        styled_label(f, "Category").pack(anchor="w", pady=(0, 3))
-        self.cat_var = tk.StringVar(value=CATEGORIES[0])
-
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("Dark.TCombobox",
-            fieldbackground=C["surface"], background=C["surface"],
-            foreground=C["text"], selectbackground=C["surface"],
-            selectforeground=C["text"], arrowcolor=C["subtext"]
-        )
-        ttk.Combobox(
-            f, textvariable=self.cat_var,
-            values=CATEGORIES, state="normal",
-            width=36, font=("Segoe UI", 10),
-            style="Dark.TCombobox"
-        ).pack(fill="x", pady=(0, 10))
-
-        # ── Note
-        styled_label(f, "Note  (optional)").pack(anchor="w", pady=(0, 3))
-        self.note_var  = tk.StringVar()
-        note_entry     = styled_entry(f, self.note_var)
-        note_entry.pack(fill="x", pady=(0, 12))
-        note_entry.bind("<Return>", lambda e: self._submit())
-        note_entry.focus_set()
-
-        # ── Buttons
-        btn_row = tk.Frame(f, bg=C["bg"])
-        btn_row.pack(anchor="e")
-        styled_button(btn_row, "Skip",     self._dismiss, style="ghost").pack(side="left", padx=(0, 8))
-        styled_button(btn_row, "Log it →", self._submit,  style="primary").pack(side="left")
-
-        self.log_toast = tk.Label(f, text="", bg=C["bg"], font=("Segoe UI", 9))
-        self.log_toast.pack(pady=(8, 0))
-
-        # Start ticking
-        self._tick_clock()
-        self._tick_countdown(self.countdown_seconds)
-
-        return f
-
-    def _tick_clock(self):
-        now         = datetime.now()
-        is_overtime = not in_range(now_minutes(),
-                                   self.cfg["work_start"],
-                                   self.cfg["work_end"])
-        is_lunch    = in_range(now_minutes(),
-                               self.cfg["lunch_start"],
-                               self.cfg["lunch_end"])
-        color  = C["red"]    if is_overtime else C["accent"]
-        status = "⚠ Overtime" if is_overtime else \
-                 "🍽 Lunch"    if is_lunch    else \
-                 "On the clock"
-
-        self.clock_var.set(now.strftime("%H:%M:%S"))
-        self.date_var.set(now.strftime("%a, %d %b"))
-        self.status_var.set(status)
-        self.clock_lbl.config(fg=color)
-        self.status_lbl.config(fg=color if is_overtime else C["green"] if not is_lunch else C["purple"])
-
-        job = self.win.after(1000, self._tick_clock)
-        self._jobs.append(job)
-
-    def _tick_countdown(self, remaining: int):
-        if remaining < 0:
-            remaining = 0
-        mins = remaining // 60
-        secs = remaining % 60
-        self.countdown_var.set(f"{mins:02d}:{secs:02d}")
-
-        # Colour shifts as deadline approaches
-        if remaining <= 60:
-            self.countdown_var  # urgent
-            color = C["red"]
-        elif remaining <= 300:
-            color = C["orange"]
-        else:
-            color = C["subtext"]
-
-        # Update countdown label colour
-        for w in self.panels["Log"].winfo_children():
-            pass  # colour set inline below
-
-        if remaining > 0:
-            job = self.win.after(1000, self._tick_countdown, remaining - 1)
-            self._jobs.append(job)
-            # Update colour on the countdown label directly
-            self.panels["Log"].nametowidget(
-                self.countdown_var._name  # fallback — use direct ref below
-            ) if False else None
-
-        # Direct colour update via stored reference
-        try:
-            self._countdown_label.config(fg=color)
-        except AttributeError:
-            pass  # label not stored yet on first call — harmless
-
-    def _build_log_panel(self):
-        f = tk.Frame(self.container, bg=C["bg"])
-
-        # ── Clock + countdown row
-        top_row = tk.Frame(f, bg=C["bg"])
-        top_row.pack(fill="x", pady=(0, 10))
-
-        self.clock_var = tk.StringVar(value="--:--:--")
-        self.clock_lbl = tk.Label(
-            top_row, textvariable=self.clock_var,
-            bg=C["bg"], fg=C["accent"],
-            font=("Consolas", 26, "bold")
-        )
-        self.clock_lbl.pack(side="left")
-
+        # Date + status
         meta = tk.Frame(top_row, bg=C["bg"])
         meta.pack(side="left", padx=(10, 0))
         self.date_var   = tk.StringVar()
@@ -417,23 +273,21 @@ class TrackerWindow:
                  bg=C["bg"], fg=C["subtext"],
                  font=("Segoe UI", 9)).pack(anchor="w")
         self.status_lbl = tk.Label(meta, textvariable=self.status_var,
-                 bg=C["bg"], fg=C["green"],
-                 font=("Segoe UI", 9, "bold"))
+                                   bg=C["bg"], fg=C["green"],
+                                   font=("Segoe UI", 9, "bold"))
         self.status_lbl.pack(anchor="w")
 
-        # Countdown — far right
+        # Countdown
         cd_frame = tk.Frame(top_row, bg=C["bg"])
         cd_frame.pack(side="right")
         tk.Label(cd_frame, text="next poll",
                  bg=C["bg"], fg=C["subtext"],
                  font=("Segoe UI", 8)).pack(anchor="e")
         self.countdown_var = tk.StringVar(value="--:--")
-        self._countdown_label = tk.Label(
-            cd_frame, textvariable=self.countdown_var,
-            bg=C["bg"], fg=C["subtext"],
-            font=("Consolas", 14, "bold")
-        )
-        self._countdown_label.pack(anchor="e")
+        self._cd_lbl = tk.Label(cd_frame, textvariable=self.countdown_var,
+                                bg=C["bg"], fg=C["subtext"],
+                                font=("Consolas", 14, "bold"))
+        self._cd_lbl.pack(anchor="e")
 
         # Category
         styled_label(f, "Category").pack(anchor="w", pady=(0, 3))
@@ -443,19 +297,16 @@ class TrackerWindow:
         style.configure("Dark.TCombobox",
             fieldbackground=C["surface"], background=C["surface"],
             foreground=C["text"], selectbackground=C["surface"],
-            selectforeground=C["text"], arrowcolor=C["subtext"]
-        )
-        ttk.Combobox(
-            f, textvariable=self.cat_var,
-            values=CATEGORIES, state="normal",
-            width=36, font=("Segoe UI", 10),
-            style="Dark.TCombobox"
-        ).pack(fill="x", pady=(0, 10))
+            selectforeground=C["text"], arrowcolor=C["subtext"])
+        ttk.Combobox(f, textvariable=self.cat_var,
+                     values=CATEGORIES, state="normal",
+                     width=36, font=("Segoe UI", 10),
+                     style="Dark.TCombobox").pack(fill="x", pady=(0, 10))
 
         # Note
         styled_label(f, "Note  (optional)").pack(anchor="w", pady=(0, 3))
         self.note_var = tk.StringVar()
-        note_entry    = styled_entry(f, self.note_var)
+        note_entry = styled_entry(f, self.note_var)
         note_entry.pack(fill="x", pady=(0, 12))
         note_entry.bind("<Return>", lambda e: self._submit())
         note_entry.focus_set()
@@ -469,10 +320,52 @@ class TrackerWindow:
         self.log_toast = tk.Label(f, text="", bg=C["bg"], font=("Segoe UI", 9))
         self.log_toast.pack(pady=(8, 0))
 
+        # Start ticking — panels dict exists at this point
         self._tick_clock()
         self._tick_countdown(self.countdown_seconds)
 
         return f
+
+    def _tick_clock(self):
+        now         = dt.datetime.now()
+        now_m       = now.hour * 60 + now.minute
+        is_overtime = not in_range(now_m, self.cfg["work_start"], self.cfg["work_end"])
+        is_lunch    = in_range(now_m, self.cfg["lunch_start"], self.cfg["lunch_end"])
+
+        color  = C["red"] if is_overtime else C["accent"]
+        status = "⚠  Overtime"    if is_overtime else \
+                 "🍽  Lunch break" if is_lunch    else \
+                 "On the clock"
+
+        self.clock_var.set(now.strftime("%H:%M:%S"))
+        self.date_var.set(now.strftime("%a, %d %b"))
+        self.status_var.set(status)
+        self.clock_lbl.config(fg=color)
+        self.status_lbl.config(
+            fg=C["red"] if is_overtime else
+               C["purple"] if is_lunch else
+               C["green"]
+        )
+
+        job = self.win.after(1000, self._tick_clock)
+        self._jobs.append(job)
+
+    def _tick_countdown(self, remaining: int):
+        if remaining < 0:
+            remaining = 0
+
+        mins = remaining // 60
+        secs = remaining % 60
+        self.countdown_var.set(f"{mins:02d}:{secs:02d}")
+
+        color = C["red"]    if remaining <= 60  else \
+                C["orange"] if remaining <= 300 else \
+                C["subtext"]
+        self._cd_lbl.config(fg=color)
+
+        if remaining > 0:
+            job = self.win.after(1000, self._tick_countdown, remaining - 1)
+            self._jobs.append(job)
 
     # ── History panel ─────────────────────────────────────────────────────────
     def _build_history_panel(self):
@@ -495,7 +388,8 @@ class TrackerWindow:
         self.hist_inner.bind("<Configure>", lambda e:
             self.hist_canvas.configure(
                 scrollregion=self.hist_canvas.bbox("all")))
-        self.hist_canvas.create_window((0, 0), window=self.hist_inner, anchor="nw")
+        self.hist_canvas.create_window((0, 0), window=self.hist_inner,
+                                       anchor="nw")
         self.hist_canvas.configure(yscrollcommand=scrollbar.set)
         self.hist_canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
@@ -527,7 +421,8 @@ class TrackerWindow:
         }
 
         for r in rows:
-            row_f = tk.Frame(self.hist_inner, bg=C["surface"], pady=5, padx=8)
+            row_f = tk.Frame(self.hist_inner, bg=C["surface"],
+                             pady=5, padx=8)
             row_f.pack(fill="x", pady=2)
 
             tk.Label(row_f, text=r["time_slot"],
@@ -539,7 +434,7 @@ class TrackerWindow:
                      font=("Segoe UI", 9, "bold"),
                      anchor="w").pack(side="left", padx=(4, 0))
 
-            et      = r["entry_type"]
+            et       = r["entry_type"]
             fg_, bg_ = badge_map.get(et, (C["subtext"], C["border"]))
             tk.Label(row_f, text=et,
                      bg=bg_, fg=fg_,
@@ -651,24 +546,12 @@ class TrackerWindow:
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 class Scheduler:
-    """
-    Runs in a background daemon thread.
-    Never touches Tkinter directly.
-    Posts work to main thread via ui_queue.
-    """
-    def __init__(self, ui_queue: queue.Queue):
+    def __init__(self, ui_queue):
         self.ui_queue           = ui_queue
         self.cfg                = load_config()
         self.consecutive_missed = 0
-        self._next_poll_time    = None   # datetime of next popup
 
-    def _seconds_until_next(self) -> int:
-        if self._next_poll_time is None:
-            return self.cfg["interval_minutes"] * 60
-        delta = (self._next_poll_time - datetime.now()).total_seconds()
-        return max(0, int(delta))
-
-    def on_submit(self, category: str, note: str):
+    def on_submit(self, category, note):
         now_m       = now_minutes()
         is_overtime = not in_range(now_m, self.cfg["work_start"], self.cfg["work_end"])
         append_row({
@@ -704,18 +587,19 @@ class Scheduler:
             self.cfg     = load_config()
             interval_sec = self.cfg["interval_minutes"] * 60
 
-            self._next_poll_time = datetime.now().__class__.now()
-            import datetime as dt
-            self._next_poll_time = dt.datetime.now() + dt.timedelta(seconds=interval_sec)
-
-            # Sleep in 1-second increments so countdown stays accurate
-            for _ in range(interval_sec):
+            # Sleep in 1s ticks so countdown stays accurate
+            for remaining in range(interval_sec, 0, -1):
                 time.sleep(1)
+                # Update countdown in any open window via queue
+                self.ui_queue.put({
+                    "action":    "countdown_tick",
+                    "remaining": remaining - 1
+                })
 
             self.cfg  = load_config()
             now_m     = now_minutes()
-            is_lunch  = in_range(now_m, self.cfg["lunch_start"], self.cfg["lunch_end"])
-
+            is_lunch  = in_range(now_m, self.cfg["lunch_start"],
+                                        self.cfg["lunch_end"])
             if is_lunch:
                 append_row({
                     "date":       today_str(),
@@ -725,40 +609,36 @@ class Scheduler:
                     "note":       "",
                     "entry_type": "lunch"
                 })
-                self._next_poll_time = None
                 continue
 
-            # Post popup request to main thread
             self.ui_queue.put({
                 "action":    "show_popup",
                 "tab":       "Log",
                 "countdown": self.cfg["interval_minutes"] * 60
             })
-            self._next_poll_time = None
 
 
-# ── Main loop (runs on main thread) ──────────────────────────────────────────
+# ── App (main thread) ─────────────────────────────────────────────────────────
 class App:
     def __init__(self):
         self.cfg        = load_config()
         self.ui_queue   = queue.Queue()
         self.scheduler  = Scheduler(self.ui_queue)
-        self.active_win = None   # currently open TrackerWindow
+        self.active_win = None
 
-        # Hidden root — never shown, just hosts after() calls
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title("Productivity Tracker")
 
     def _open_window(self, start_tab="Log", countdown=0):
-        # If a window is already open, just lift it to the correct tab
+        # Window already open — lift and switch tab
         if self.active_win is not None:
             try:
                 self.active_win.tab_bar._switch(start_tab)
                 self.active_win.win.lift()
                 return
             except tk.TclError:
-                self.active_win = None   # window was destroyed
+                self.active_win = None
 
         self.active_win = TrackerWindow(
             root              = self.root,
@@ -781,14 +661,26 @@ class App:
         try:
             while True:
                 msg = self.ui_queue.get_nowait()
+
                 if msg["action"] == "show_popup":
                     self._open_window(start_tab=msg["tab"],
                                       countdown=msg.get("countdown", 0))
+
                 elif msg["action"] == "show_history":
                     self._open_window(start_tab="History")
+
+                elif msg["action"] == "countdown_tick":
+                    # Update countdown on open window if it exists
+                    if self.active_win is not None:
+                        try:
+                            self.active_win._tick_countdown(msg["remaining"])
+                        except (tk.TclError, AttributeError):
+                            pass
+
         except queue.Empty:
             pass
-        self.root.after(200, self._poll_queue)   # check queue every 200ms
+
+        self.root.after(200, self._poll_queue)
 
     def _build_tray(self):
         try:
@@ -802,12 +694,12 @@ class App:
             draw.line([32, 32, 32, 22], fill="#89b4fa", width=3)
             draw.line([32, 32, 40, 36], fill="#cdd6f4", width=2)
 
-            def on_tray_click(icon, item):
-                # Left-click or default action → History
+            def on_click(icon, item):
                 self.ui_queue.put({"action": "show_history"})
 
             def open_settings(icon, item):
-                self.ui_queue.put({"action": "show_popup", "tab": "Settings", "countdown": 0})
+                self.ui_queue.put({"action": "show_popup",
+                                   "tab": "Settings", "countdown": 0})
 
             def do_export(icon, item):
                 out = export_csv()
@@ -819,32 +711,29 @@ class App:
                 self.root.after(0, self.root.destroy)
 
             menu = pystray.Menu(
-                pystray.MenuItem("History",    on_tray_click, default=True),
+                pystray.MenuItem("History",    on_click, default=True),
                 pystray.MenuItem("Settings",   open_settings),
                 pystray.MenuItem("Export CSV", do_export),
                 pystray.MenuItem("Quit",       quit_app),
             )
-            icon = pystray.Icon("ProductivityTracker", img,
+            return pystray.Icon("ProductivityTracker", img,
                                 "Productivity Tracker", menu)
-            return icon
         except ImportError:
             return None
 
     def run(self):
-        # Scheduler in background daemon thread
-        t = threading.Thread(target=self.scheduler.run, daemon=True)
-        t.start()
+        # Scheduler — daemon thread
+        threading.Thread(target=self.scheduler.run, daemon=True).start()
 
-        # Start queue polling on main thread
+        # Queue polling — main thread
         self.root.after(200, self._poll_queue)
 
-        # Tray in its own daemon thread
+        # Pystray — daemon thread
         tray = self._build_tray()
         if tray:
-            tray_thread = threading.Thread(target=tray.run, daemon=True)
-            tray_thread.start()
+            threading.Thread(target=tray.run, daemon=True).start()
 
-        # Main thread runs Tkinter event loop — owns all UI
+        # Tkinter owns the main thread
         self.root.mainloop()
 
 
