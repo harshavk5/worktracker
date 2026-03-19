@@ -550,6 +550,8 @@ class Scheduler:
         self.cfg                = load_config()
         self.consecutive_missed = 0
         self._deadline          = None   # set by run(), read by remaining_seconds()
+        self._response_event    = threading.Event()  # set when user submits or dismisses
+        self.waiting_for_response = False  # True only when scheduler fired the popup
 
     def on_submit(self, category, note):
         now_m       = now_minutes()
@@ -563,6 +565,8 @@ class Scheduler:
             "entry_type": "overtime" if is_overtime else "logged"
         })
         self.consecutive_missed = 0
+        if self.waiting_for_response:
+            self._response_event.set()  # unblock scheduler only if it fired this popup
 
     def on_dismiss(self):
         now_m       = now_minutes()
@@ -581,6 +585,8 @@ class Scheduler:
             if self.consecutive_missed >= threshold:
                 retro_mark_break(threshold)
                 self.consecutive_missed = 0
+        if self.waiting_for_response:
+            self._response_event.set()  # unblock scheduler only if it fired this popup
 
     def remaining_seconds(self) -> int:
         """How many seconds until the next popup fires. Thread-safe read."""
@@ -618,11 +624,28 @@ class Scheduler:
                 })
                 continue
 
+            # Fire popup then wait for user response before starting next countdown
+            self._response_event.clear()
+            self.waiting_for_response = True
             self.ui_queue.put({
-                "action":    "show_popup",
-                "tab":       "Log",
-                "countdown": self.cfg["interval_minutes"] * 60
+                "action": "show_popup",
+                "tab":    "Log",
             })
+            # Block until user submits or dismisses (or 5 min timeout — then auto-miss)
+            responded = self._response_event.wait(timeout=5 * 60)
+            self.waiting_for_response = False
+            if not responded:
+                # Timed out — auto-log as missed if not already logged
+                now_m2      = now_minutes()
+                is_overtime2= not in_range(now_m2, self.cfg["work_start"], self.cfg["work_end"])
+                append_row({
+                    "date":       today_str(),
+                    "time_slot":  current_slot(),
+                    "day":        day_name(),
+                    "category":   "",
+                    "note":       "",
+                    "entry_type": "overtime" if is_overtime2 else "missed"
+                })
 
 
 # ── App (main thread) ─────────────────────────────────────────────────────────
