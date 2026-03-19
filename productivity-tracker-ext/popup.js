@@ -68,7 +68,12 @@ document.querySelectorAll(".tab").forEach(tab => {
 async function initLogPanel() {
   const pending = await getPendingSlot();
   const slot    = pending ? pending.time_slot : currentSlot();
-  document.getElementById("slot-time").textContent = slot;
+  const label   = document.getElementById("slot-time");
+  label.textContent = slot;
+  if (pending?.is_overtime) {
+    label.textContent += " — Overtime";
+    label.style.color = "var(--red)";
+  }
   document.getElementById("note").focus();
 }
 
