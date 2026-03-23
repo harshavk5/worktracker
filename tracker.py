@@ -129,6 +129,11 @@ def in_range(now_m: int, start: str, end: str) -> bool:
 def today_str()    -> str: return dt.datetime.now().strftime("%Y-%m-%d")
 def day_name()     -> str: return dt.datetime.now().strftime("%A")
 def current_slot() -> str: return dt.datetime.now().strftime("%H:%M")
+def is_weekend()   -> bool: return dt.datetime.now().weekday() >= 5  # 5=Sat, 6=Sun
+def is_quiet_hours() -> bool:
+    """No popups between 22:00 and 07:00."""
+    h = dt.datetime.now().hour
+    return h >= 22 or h < 7
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
 def styled_button(parent, text, command, style="primary"):
@@ -220,6 +225,11 @@ class TrackerWindow:
         self._build()
         self.tab_bar._switch(start_tab)
 
+        # Auto-close after 10s if no input — only for scheduler-fired popups
+        if start_tab == "Log" and scheduler is not None:
+            job = self.win.after(10_000, self._auto_dismiss)
+            self._jobs.append(job)
+
     # ── Build ─────────────────────────────────────────────────────────────────
     def _build(self):
         self.tab_bar = TabBar(self.win,
@@ -298,10 +308,13 @@ class TrackerWindow:
             fieldbackground=C["surface"], background=C["surface"],
             foreground=C["text"], selectbackground=C["surface"],
             selectforeground=C["text"], arrowcolor=C["subtext"])
-        ttk.Combobox(f, textvariable=self.cat_var,
-                     values=CATEGORIES, state="normal",
-                     width=36, font=("Segoe UI", 10),
-                     style="Dark.TCombobox").pack(fill="x", pady=(0, 10))
+        combo = ttk.Combobox(f, textvariable=self.cat_var,
+                              values=CATEGORIES, state="readonly",
+                              width=36, font=("Segoe UI", 10),
+                              style="Dark.TCombobox")
+        combo.pack(fill="x", pady=(0, 10))
+        # Open dropdown on click anywhere on the widget, not just the arrow
+        combo.bind("<Button-1>", lambda e: combo.event_generate("<Down>"))
 
         # Note
         styled_label(f, "Note  (optional)").pack(anchor="w", pady=(0, 3))
@@ -329,11 +342,11 @@ class TrackerWindow:
     def _tick_clock(self):
         now         = dt.datetime.now()
         now_m       = now.hour * 60 + now.minute
-        is_overtime = not in_range(now_m, self.cfg["work_start"], self.cfg["work_end"])
+        is_overtime = is_weekend() or not in_range(now_m, self.cfg["work_start"], self.cfg["work_end"])
         is_lunch    = in_range(now_m, self.cfg["lunch_start"], self.cfg["lunch_end"])
 
         color  = C["red"] if is_overtime else C["accent"]
-        status = "⚠  Overtime"    if is_overtime else \
+        status = "⚠  On-call"    if is_overtime else \
                  "🍽  Lunch break" if is_lunch    else \
                  "On the clock"
 
@@ -393,15 +406,25 @@ class TrackerWindow:
         self.hist_canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
+        # Mousewheel scroll — bind to canvas and all children
+        def _on_mousewheel(event):
+            self.hist_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.hist_canvas.bind("<MouseWheel>", _on_mousewheel)
+        self.hist_inner.bind("<MouseWheel>", _on_mousewheel)
+        # Store so _render_history can rebind new child rows
+        self._hist_scroll = _on_mousewheel
+
         return f
 
     def _render_history(self):
         for w in self.hist_inner.winfo_children():
             w.destroy()
 
-        today = today_str()
+        today        = today_str()
+        hidden_types = {"missed", "break"}   # hidden in UI, present in CSV
         rows  = sorted(
-            [r for r in read_rows() if r["date"] == today],
+            [r for r in read_rows()
+             if r["date"] == today and r["entry_type"] not in hidden_types],
             key=lambda r: r["time_slot"]
         )
 
@@ -416,8 +439,13 @@ class TrackerWindow:
             "missed":   (C["orange"], "#3a2a1e"),
             "break":    (C["subtext"],C["border"]),
             "lunch":    (C["purple"], "#2a1e3a"),
-            "overtime": (C["red"],    "#3a1e2a"),
+            "on-call":  (C["red"],    "#3a1e2a"),
         }
+
+        def _bind_scroll(widget):
+            widget.bind("<MouseWheel>", self._hist_scroll)
+            for child in widget.winfo_children():
+                _bind_scroll(child)
 
         for r in rows:
             row_f = tk.Frame(self.hist_inner, bg=C["surface"],
@@ -446,6 +474,7 @@ class TrackerWindow:
                 tk.Label(nf, text=f"  ↳ {r['note']}",
                          bg=C["surface"], fg=C["subtext"],
                          font=("Segoe UI", 8), anchor="w").pack(side="left")
+            _bind_scroll(row_f)
 
     # ── Settings panel ────────────────────────────────────────────────────────
     def _build_settings_panel(self):
@@ -530,6 +559,15 @@ class TrackerWindow:
                 pass
         self._jobs.clear()
 
+    def _auto_dismiss(self):
+        """Called after 10s with no input — silently dismiss."""
+        self._cancel_jobs()
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+        self.on_dismiss()
+
     def _submit(self):
         category = self.cat_var.get().strip() or "Other"
         note     = self.note_var.get().strip()
@@ -555,14 +593,14 @@ class Scheduler:
 
     def on_submit(self, category, note):
         now_m       = now_minutes()
-        is_overtime = not in_range(now_m, self.cfg["work_start"], self.cfg["work_end"])
+        is_overtime = is_weekend() or not in_range(now_m, self.cfg["work_start"], self.cfg["work_end"])
         append_row({
             "date":       today_str(),
             "time_slot":  current_slot(),
             "day":        day_name(),
             "category":   category,
             "note":       note,
-            "entry_type": "overtime" if is_overtime else "logged"
+            "entry_type": "on-call" if is_overtime else "logged"
         })
         self.consecutive_missed = 0
         if self.waiting_for_response:
@@ -570,14 +608,14 @@ class Scheduler:
 
     def on_dismiss(self):
         now_m       = now_minutes()
-        is_overtime = not in_range(now_m, self.cfg["work_start"], self.cfg["work_end"])
+        is_overtime = is_weekend() or not in_range(now_m, self.cfg["work_start"], self.cfg["work_end"])
         append_row({
             "date":       today_str(),
             "time_slot":  current_slot(),
             "day":        day_name(),
             "category":   "",
             "note":       "",
-            "entry_type": "overtime" if is_overtime else "missed"
+            "entry_type": "on-call" if is_overtime else "missed"
         })
         if not is_overtime:
             self.consecutive_missed += 1
@@ -611,8 +649,13 @@ class Scheduler:
 
             self.cfg  = load_config()
             now_m     = now_minutes()
-            is_lunch  = in_range(now_m, self.cfg["lunch_start"],
-                                        self.cfg["lunch_end"])
+            # Quiet hours — complete silence, no log, no popup
+            if is_quiet_hours():
+                continue
+
+            is_weekend_day = is_weekend()
+            is_lunch  = (not is_weekend_day) and in_range(now_m, self.cfg["lunch_start"],
+                                                           self.cfg["lunch_end"])
             if is_lunch:
                 append_row({
                     "date":       today_str(),
@@ -637,14 +680,14 @@ class Scheduler:
             if not responded:
                 # Timed out — auto-log as missed if not already logged
                 now_m2      = now_minutes()
-                is_overtime2= not in_range(now_m2, self.cfg["work_start"], self.cfg["work_end"])
+                is_overtime2= is_weekend() or not in_range(now_m2, self.cfg["work_start"], self.cfg["work_end"])
                 append_row({
                     "date":       today_str(),
                     "time_slot":  current_slot(),
                     "day":        day_name(),
                     "category":   "",
                     "note":       "",
-                    "entry_type": "overtime" if is_overtime2 else "missed"
+                    "entry_type": "on-call" if is_overtime2 else "missed"
                 })
 
 
