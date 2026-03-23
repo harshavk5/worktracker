@@ -206,11 +206,12 @@ class TrackerWindow:
     """
 
     def __init__(self, root, cfg, on_submit, on_dismiss,
-                 start_tab="Log", scheduler=None):
+                 start_tab="Log", scheduler=None, auto_close=False):
         self.cfg        = cfg
         self.on_submit  = on_submit
         self.on_dismiss = on_dismiss
         self.scheduler  = scheduler   # used to read live remaining seconds
+        self.auto_close = auto_close  # True only when scheduler fires the popup
         self._jobs      = []
 
         self.win = tk.Toplevel(root)
@@ -225,8 +226,8 @@ class TrackerWindow:
         self._build()
         self.tab_bar._switch(start_tab)
 
-        # Auto-close after 10s if no input — only for scheduler-fired popups
-        if start_tab == "Log" and scheduler is not None:
+        # Auto-close after 10s — only when scheduler explicitly requests it
+        if self.auto_close:
             job = self.win.after(10_000, self._auto_dismiss)
             self._jobs.append(job)
 
@@ -301,7 +302,7 @@ class TrackerWindow:
 
         # Category
         styled_label(f, "Category").pack(anchor="w", pady=(0, 3))
-        self.cat_var = tk.StringVar(value=CATEGORIES[0])
+        self.cat_var = tk.StringVar(value="Deep Work")
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("Dark.TCombobox",
@@ -322,7 +323,8 @@ class TrackerWindow:
         note_entry = styled_entry(f, self.note_var)
         note_entry.pack(fill="x", pady=(0, 12))
         note_entry.bind("<Return>", lambda e: self._submit())
-        note_entry.focus_set()
+        # Defer focus — ensures it fires after window is fully rendered
+        self.win.after(50, note_entry.focus_set)
 
         # Buttons
         btn_row = tk.Frame(f, bg=C["bg"])
@@ -671,8 +673,9 @@ class Scheduler:
             self._response_event.clear()
             self.waiting_for_response = True
             self.ui_queue.put({
-                "action": "show_popup",
-                "tab":    "Log",
+                "action":          "show_popup",
+                "tab":             "Log",
+                "scheduler_fired": True
             })
             # Block until user submits or dismisses (or 5 min timeout — then auto-miss)
             responded = self._response_event.wait(timeout=5 * 60)
@@ -703,7 +706,7 @@ class App:
         self.root.withdraw()
         self.root.title("Productivity Tracker")
 
-    def _open_window(self, start_tab="Log", **_):
+    def _open_window(self, start_tab="Log", **kwargs):
         # Window already open — lift and switch tab
         if self.active_win is not None:
             try:
@@ -719,7 +722,8 @@ class App:
             on_submit   = self._on_submit,
             on_dismiss  = self._on_dismiss,
             start_tab   = start_tab,
-            scheduler   = self.scheduler
+            scheduler   = self.scheduler,
+            auto_close  = (start_tab == "Log" and kwargs.get("scheduler_fired", False))
         )
 
     def _on_submit(self, category, note):
@@ -736,8 +740,10 @@ class App:
                 msg = self.ui_queue.get_nowait()
 
                 if msg["action"] == "show_popup":
-                    self._open_window(start_tab=msg["tab"],
-                                      countdown=msg.get("countdown", 0))
+                    self._open_window(
+                        start_tab       = msg["tab"],
+                        scheduler_fired = msg.get("scheduler_fired", False)
+                    )
 
                 elif msg["action"] == "show_history":
                     self._open_window(start_tab="History")
