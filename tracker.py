@@ -15,7 +15,6 @@ import threading
 import queue
 import datetime as dt
 import tkinter as tk
-from tkinter import ttk
 from pathlib import Path
 import json
 
@@ -34,15 +33,6 @@ DEFAULT_CONFIG = {
     "lunch_end":               "13:30",
     "break_threshold_windows": 2
 }
-
-CATEGORIES = [
-    "Deep Work",
-    "Meeting / Call",
-    "Review / Feedback",
-    "Admin / Email",
-    "Learning",
-    "Other"
-]
 
 CSV_HEADERS = ["date", "time_slot", "day", "category", "note", "entry_type"]
 
@@ -300,25 +290,8 @@ class TrackerWindow:
                                 font=("Consolas", 14, "bold"))
         self._cd_lbl.pack(anchor="e")
 
-        # Category
-        styled_label(f, "Category").pack(anchor="w", pady=(0, 3))
-        self.cat_var = tk.StringVar(value="Deep Work")
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("Dark.TCombobox",
-            fieldbackground=C["surface"], background=C["surface"],
-            foreground=C["text"], selectbackground=C["surface"],
-            selectforeground=C["text"], arrowcolor=C["subtext"])
-        combo = ttk.Combobox(f, textvariable=self.cat_var,
-                              values=CATEGORIES, state="readonly",
-                              width=36, font=("Segoe UI", 10),
-                              style="Dark.TCombobox")
-        combo.pack(fill="x", pady=(0, 10))
-        # Open dropdown on click anywhere on the widget, not just the arrow
-        combo.bind("<Button-1>", lambda e: combo.event_generate("<Down>"))
-
         # Note
-        styled_label(f, "Note  (optional)").pack(anchor="w", pady=(0, 3))
+        styled_label(f, "What are you working on?").pack(anchor="w", pady=(0, 3))
         self.note_var = tk.StringVar()
         note_entry = styled_entry(f, self.note_var)
         note_entry.pack(fill="x", pady=(0, 12))
@@ -458,10 +431,11 @@ class TrackerWindow:
                      bg=C["surface"], fg=C["subtext"],
                      font=("Consolas", 9), width=5,
                      anchor="w").pack(side="left")
-            tk.Label(row_f, text=r["category"] or "—",
+            tk.Label(row_f,
+                     text=r["note"] if r["note"] else "—",
                      bg=C["surface"], fg=C["text"],
-                     font=("Segoe UI", 9, "bold"),
-                     anchor="w").pack(side="left", padx=(4, 0))
+                     font=("Segoe UI", 9),
+                     anchor="w").pack(side="left", padx=(6, 0))
 
             et       = r["entry_type"]
             fg_, bg_ = badge_map.get(et, (C["subtext"], C["border"]))
@@ -469,13 +443,6 @@ class TrackerWindow:
                      bg=bg_, fg=fg_,
                      font=("Segoe UI", 8, "bold"),
                      padx=5, pady=1).pack(side="right")
-
-            if r["note"]:
-                nf = tk.Frame(self.hist_inner, bg=C["surface"])
-                nf.pack(fill="x", pady=(0, 2))
-                tk.Label(nf, text=f"  ↳ {r['note']}",
-                         bg=C["surface"], fg=C["subtext"],
-                         font=("Segoe UI", 8), anchor="w").pack(side="left")
             _bind_scroll(row_f)
 
     # ── Settings panel ────────────────────────────────────────────────────────
@@ -571,11 +538,10 @@ class TrackerWindow:
         self.on_dismiss()
 
     def _submit(self):
-        category = self.cat_var.get().strip() or "Other"
-        note     = self.note_var.get().strip()
+        note = self.note_var.get().strip()
         self._cancel_jobs()
         self.win.destroy()
-        self.on_submit(category, note)
+        self.on_submit(note)
 
     def _dismiss(self):
         self._cancel_jobs()
@@ -593,14 +559,14 @@ class Scheduler:
         self._response_event    = threading.Event()  # set when user submits or dismisses
         self.waiting_for_response = False  # True only when scheduler fired the popup
 
-    def on_submit(self, category, note):
+    def on_submit(self, note):
         now_m       = now_minutes()
         is_overtime = is_weekend() or not in_range(now_m, self.cfg["work_start"], self.cfg["work_end"])
         append_row({
             "date":       today_str(),
             "time_slot":  current_slot(),
             "day":        day_name(),
-            "category":   category,
+            "category":   "",
             "note":       note,
             "entry_type": "on-call" if is_overtime else "logged"
         })
@@ -726,9 +692,9 @@ class App:
             auto_close  = (start_tab == "Log" and kwargs.get("scheduler_fired", False))
         )
 
-    def _on_submit(self, category, note):
+    def _on_submit(self, note):
         self.active_win = None
-        self.scheduler.on_submit(category, note)
+        self.scheduler.on_submit(note)
 
     def _on_dismiss(self):
         self.active_win = None
