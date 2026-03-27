@@ -216,10 +216,12 @@ class TrackerWindow:
         self._build()
         self.tab_bar._switch(start_tab)
 
-        # Auto-close after 10s — only when scheduler explicitly requests it
+        # Auto-close countdown — only when scheduler explicitly requests it
+        self._ac_remaining  = 10      # seconds remaining before auto-close
+        self._ac_job        = None    # handle so we can cancel it
+        self._ac_cancelled  = False   # set True on any user interaction
         if self.auto_close:
-            job = self.win.after(10_000, self._auto_dismiss)
-            self._jobs.append(job)
+            self._ac_tick()
 
     # ── Build ─────────────────────────────────────────────────────────────────
     def _build(self):
@@ -305,8 +307,20 @@ class TrackerWindow:
         styled_button(btn_row, "Skip",     self._dismiss, style="ghost").pack(side="left", padx=(0, 8))
         styled_button(btn_row, "Log it →", self._submit,  style="primary").pack(side="left")
 
+        # Auto-close countdown label — visible only during scheduler popups
+        self._ac_lbl = tk.Label(f, text="",
+                                bg=C["bg"], fg=C["orange"],
+                                font=("Segoe UI", 8))
+        self._ac_lbl.pack(pady=(6, 0))
+
         self.log_toast = tk.Label(f, text="", bg=C["bg"], font=("Segoe UI", 9))
-        self.log_toast.pack(pady=(8, 0))
+        self.log_toast.pack(pady=(2, 0))
+
+        # Cancel auto-close on any click or keypress anywhere in window
+        self.win.bind("<Button-1>",  self._cancel_autoclose)
+        self.win.bind("<Button-3>",  self._cancel_autoclose)
+        self.win.bind("<Key>",       self._cancel_autoclose)
+        note_entry.bind("<Key>",     self._cancel_autoclose)
 
         # Start ticking — panels dict exists at this point
         self._tick_clock()
@@ -528,14 +542,47 @@ class TrackerWindow:
                 pass
         self._jobs.clear()
 
-    def _auto_dismiss(self):
-        """Called after 10s with no input — silently dismiss."""
-        self._cancel_jobs()
+    def _ac_tick(self):
+        """Tick the auto-close countdown every second. Cancels on any interaction."""
+        if self._ac_cancelled or not self.auto_close:
+            return
+        if self._ac_remaining <= 0:
+            self._cancel_jobs()
+            try:
+                self.win.destroy()
+            except tk.TclError:
+                pass
+            self.on_dismiss()
+            return
+        # Update the countdown label in the log panel
         try:
-            self.win.destroy()
-        except tk.TclError:
+            self._ac_lbl.config(
+                text=f"Auto-closing in {self._ac_remaining}s  —  click anywhere to cancel",
+                fg=C["red"] if self._ac_remaining <= 3 else C["orange"]
+            )
+        except (tk.TclError, AttributeError):
             pass
-        self.on_dismiss()
+        self._ac_remaining -= 1
+        self._ac_job = self.win.after(1000, self._ac_tick)
+
+    def _cancel_autoclose(self, event=None):
+        """Cancel auto-close on any user interaction."""
+        if self._ac_cancelled:
+            return
+        self._ac_cancelled = True
+        if self._ac_job:
+            try:
+                self.win.after_cancel(self._ac_job)
+            except Exception:
+                pass
+        try:
+            self._ac_lbl.config(text="")
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _auto_dismiss(self):
+        """Legacy — kept for compatibility, not used directly."""
+        pass
 
     def _submit(self):
         note = self.note_var.get().strip()
