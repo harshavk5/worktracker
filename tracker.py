@@ -93,7 +93,10 @@ def retro_mark_break(n: int):
             w.writeheader()
             w.writerows(rows)
 
+ARCHIVE_DIR = LOG_DIR / "archive"
+
 def export_csv():
+    """Export current log to exports/ and return path. Does not clear."""
     rows = read_rows()
     if not rows:
         return None
@@ -103,6 +106,53 @@ def export_csv():
         w.writeheader()
         w.writerows(rows)
     return out
+
+def weekly_archive_and_reset():
+    """
+    Export last week's data to archive/<week_of_YYYY-MM-DD>.csv,
+    then reset the live log for a fresh week.
+    Returns the archive path or None if no data.
+    """
+    rows = read_rows()
+    if not rows:
+        return None
+
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Name the archive after the Monday of the logged week
+    first_date = rows[0]["date"]   # earliest entry
+    monday     = (dt.datetime.strptime(first_date, "%Y-%m-%d")
+                  - dt.timedelta(days=dt.datetime.strptime(first_date, "%Y-%m-%d").weekday()))
+    archive_name = f"week_of_{monday.strftime('%Y-%m-%d')}.csv"
+    archive_path = ARCHIVE_DIR / archive_name
+
+    with open(archive_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+        w.writeheader()
+        w.writerows(rows)
+
+    # Reset live log
+    with open(LOG_FILE, "w", newline="") as f:
+        csv.DictWriter(f, fieldnames=CSV_HEADERS).writeheader()
+
+    return archive_path
+
+def check_monday_reset():
+    """
+    Called on startup. If today is Monday and the log has data from last week,
+    auto-archive and reset.
+    """
+    if dt.datetime.now().weekday() != 0:   # 0 = Monday
+        return None
+    rows = read_rows()
+    if not rows:
+        return None
+    today = today_str()
+    # Only reset if there's data from BEFORE today (i.e. last week)
+    old_rows = [r for r in rows if r["date"] < today]
+    if not old_rows:
+        return None
+    return weekly_archive_and_reset()
 
 # ── Time helpers ──────────────────────────────────────────────────────────────
 def now_minutes() -> int:
@@ -414,7 +464,8 @@ class TrackerWindow:
         rows  = sorted(
             [r for r in read_rows()
              if r["date"] == today and r["entry_type"] not in hidden_types],
-            key=lambda r: r["time_slot"]
+            key=lambda r: r["time_slot"],
+            reverse=True   # latest first
         )
 
         if not rows:
@@ -668,9 +719,11 @@ class Scheduler:
             if is_quiet_hours():
                 continue
 
-            is_weekend_day = is_weekend()
-            is_lunch  = (not is_weekend_day) and in_range(now_m, self.cfg["lunch_start"],
-                                                           self.cfg["lunch_end"])
+            # Weekend — complete silence
+            if is_weekend():
+                continue
+
+            is_lunch = in_range(now_m, self.cfg["lunch_start"], self.cfg["lunch_end"])
             if is_lunch:
                 append_row({
                     "date":       today_str(),
@@ -761,6 +814,10 @@ class App:
                 elif msg["action"] == "show_history":
                     self._open_window(start_tab="History")
 
+                elif msg["action"] == "show_notify":
+                    # Brief notification in tray title — no popup needed
+                    pass  # message already logged; tray tooltip not API-accessible
+
         except queue.Empty:
             pass
 
@@ -791,16 +848,22 @@ class App:
                 if out:
                     os.startfile(str(out.parent))
 
+            def do_weekly_archive(icon, item):
+                out = weekly_archive_and_reset()
+                if out:
+                    os.startfile(str(out.parent))
+
             def quit_app(icon, item):
                 icon.stop()
                 self.root.after(0, self.root.destroy)
 
             menu = pystray.Menu(
-                pystray.MenuItem("Log",        on_click, default=True),
-                pystray.MenuItem("History",    lambda i, it: i and self.ui_queue.put({"action": "show_history"})),
-                pystray.MenuItem("Settings",   open_settings),
-                pystray.MenuItem("Export CSV", do_export),
-                pystray.MenuItem("Quit",       quit_app),
+                pystray.MenuItem("Log",              on_click, default=True),
+                pystray.MenuItem("History",          lambda i, it: i and self.ui_queue.put({"action": "show_history"})),
+                pystray.MenuItem("Settings",         open_settings),
+                pystray.MenuItem("Export CSV",       do_export),
+                pystray.MenuItem("Archive Week & Reset", do_weekly_archive),
+                pystray.MenuItem("Quit",             quit_app),
             )
             return pystray.Icon("ProductivityTracker", img,
                                 "Productivity Tracker", menu)
@@ -808,6 +871,14 @@ class App:
             return None
 
     def run(self):
+        # Monday startup — auto-archive last week if needed
+        archived = check_monday_reset()
+        if archived:
+            self.ui_queue.put({
+                "action":  "show_notify",
+                "message": f"Last week archived → {archived.name}"
+            })
+
         # Scheduler — daemon thread
         threading.Thread(target=self.scheduler.run, daemon=True).start()
 
